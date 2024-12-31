@@ -28,7 +28,7 @@ function splitIdPet(num) {
 
 // Hàm để ghi đè biến môi trường
 const envFilePath = path.join(__dirname, ".env");
-function updateEnv(variable, value) {
+async function updateEnv(variable, value) {
   // Đọc file .env
   fs.readFile(envFilePath, "utf8", (err, data) => {
     if (err) {

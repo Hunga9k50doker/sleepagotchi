@@ -6,7 +6,7 @@ const { HttpsProxyAgent } = require("https-proxy-agent");
 const readline = require("readline");
 const user_agents = require("./config/userAgents");
 const settings = require("./config/config");
-const { sleep, loadData, getRandomNumber, saveToken, isTokenExpired, saveJson } = require("./utils");
+const { sleep, loadData, getRandomNumber, saveToken, isTokenExpired, saveJson, updateEnv } = require("./utils");
 const { Worker, isMainThread, parentPort, workerData } = require("worker_threads");
 const { checkBaseUrl } = require("./checkAPI");
 
@@ -447,20 +447,67 @@ class ClientAPI {
   async handleGame(data) {
     let { meta, heroes } = data;
     heroes = heroes.filter((h) => h.unlockAt == 0).sort((a, b) => b.power - a.power);
-    const result = await this.getConstellations({
-      amount: 1,
-      startIndex: meta.constellationsLastIndex,
-    });
-    if (!result.success) return;
+    let result = {
+      success: false,
+      data: { constellations: [] },
+    };
+    let startIndexMap = settings.MAP_RANGE_CHALLENGE[0] - 1;
+    let endIndexMap = meta.constellationsLastIndex;
+    if (
+      settings.MAP_RANGE_CHALLENGE[1] == 0 ||
+      !settings.ENABLE_MAP_RANGE_CHALLENGE ||
+      (settings.MAP_RANGE_CHALLENGE[0] == 0 && settings.MAP_RANGE_CHALLENGE[1] == 0) ||
+      settings.MAP_RANGE_CHALLENGE[0] > settings.MAP_RANGE_CHALLENGE[1]
+    ) {
+      startIndexMap = meta.constellationsLastIndex;
+    } else {
+      endIndexMap = Math.min(meta.constellationsLastIndex, Math.max(0, settings.MAP_RANGE_CHALLENGE[1] - 1));
+    }
+    if (endIndexMap - startIndexMap > 10) {
+      this.log(`WARNING: Range map clear > 10 [Start at: ${endIndexMap} , End at: ${endIndexMap}]. Should be less than 10`);
+    }
+    for (let i = startIndexMap; i <= endIndexMap; i++) {
+      this.log(`Checking challenge map ${i + 1}`);
+      await sleep(2);
+      const res = await this.getConstellations({
+        amount: 1,
+        startIndex: i,
+      });
+      if (res.success) {
+        result = {
+          success: true,
+          data: { constellations: [...result.data.constellations, ...res.data.constellations] },
+        };
+      }
+    }
+
     const { constellations } = result.data;
+    if (!result.success || constellations.length == 0) return;
 
     if (constellations.length > 0) {
       for (const constellation of constellations) {
         this.log(`Starting game at map ${constellation.name}`);
-
-        for (const change of constellation.challenges) {
+        const challenges = constellation.challenges.filter((c) => c.received < c.value);
+        if (challenges.length == 0) {
+          this.log(
+            `You are proccessing challenge ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
+              constellation.name
+            }`,
+            "warning"
+          );
+          continue;
+        }
+        for (const change of challenges) {
           await sleep(1);
-          if (change.cooldown > 0 || Date.now() < change.unlockAt || change.received == change.value) continue;
+          if (Date.now() < change.unlockAt) {
+            const timeDifference = change.unlockAt - Date.now();
+            const seconds = Math.floor((timeDifference / 1000) % 60);
+            const minutes = Math.floor((timeDifference / (1000 * 60)) % 60);
+            const hours = Math.floor((timeDifference / (1000 * 60 * 60)) % 24);
+            this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name}...`.yellow);
+            continue;
+          }
+          if (change.cooldown > 0) continue;
           let orderedSlots = [];
           let orderedHeroId = [];
           let isPlay = true;
@@ -468,26 +515,35 @@ class ClientAPI {
             const slot = change.orderedSlots[index];
             if (!slot.unlocked) continue;
             // fs.writeFileSync("save.json", JSON.stringify(heroes, null, 2), "utf-8");
-            const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel);
-            // console.log("hero", change, hero);
-            //  h.skill == change.heroSkill;
+            const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel && h.stars >= change.minStars);
             if (hero) {
               orderedHeroId.push(hero.heroType);
               orderedSlots.push({
                 heroType: hero.heroType,
                 slotId: index,
+                skill: hero.skill,
               });
             } else {
-              isPlay = false;
-              this.log(`No hero avaliable to go change ${change.name}`, "warning");
-              break;
+              continue;
             }
           }
 
+          //check slot
+          const hasHeroMapSkill = orderedSlots.find((s) => s.skill == change.heroSkill);
+          if (orderedSlots.length == 0 && !hasHeroMapSkill) {
+            isPlay = false;
+            this.log(`No hero avaliable to go change ${change.name}`, "warning");
+          }
+
+          // let payload = {}
           if (isPlay) {
             let payload = {
               challengeType: change.challengeType,
               heroes: orderedSlots,
+            };
+            payload = {
+              ...payload,
+              heroes: payload.heroes.map((item) => ({ heroType: item.heroType, slotId: item.slotId })),
             };
             this.log(`Starting change ${change.name} | Reward received: ${change.received}/${change.value} ${change.resourceType} | Time: ${change.time} seconds...`);
             const resChange = await this.sendToChallenge(payload);
@@ -525,14 +581,18 @@ class ClientAPI {
   }
 
   async handleCode() {
-    this.log(`Checking code...`);
+    this.log(`Checking gift code...`);
     const codes = settings.CODE_GATEWAY;
     for (const code of codes) {
       const result = await this.useRedeemCode(code);
       if (result.success) {
-        this.log(`Code ${code} sucessfully!`, "success");
+        let { rewards } = result.data;
+        rewards = Object.entries(rewards);
+        for (const reward of rewards) {
+          this.log(`Code ${code} sucessfully! | Reward: ${reward[1]?.amount} ${reward[0]}`, "success");
+        }
       } else {
-        this.log(`Code ${code} wrong or expried!`, "warning");
+        this.log(`Code ${code} wrong or expried or claimed!`, "warning");
       }
     }
   }
@@ -707,6 +767,7 @@ async function main() {
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
     }
+    await updateEnv("AUTO_CODE_GATEWAY", "false");
     await sleep(3);
     console.log("Tool được phát triển bởi nhóm tele Airdrop Hunter Siêu Tốc (https://t.me/airdrophuntersieutoc)".yellow);
     console.log(`=============Hoàn thành tất cả tài khoản | Chờ ${settings.TIME_SLEEP} phút=============`.magenta);

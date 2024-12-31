@@ -152,12 +152,26 @@ class ClientAPI {
     return this.makeRequest(`${this.baseURL}/getUserData`, "get");
   }
 
+  async getReff() {
+    return this.makeRequest(`${this.baseURL}/getReferralsInfo`, "post", {
+      page: 1,
+      rowsPerPage: 20,
+    });
+  }
+  async claimReff() {
+    return this.makeRequest(`${this.baseURL}/claimReferralRewards`, "get");
+  }
+
   async getAllHeroes() {
     return this.makeRequest(`${this.baseURL}/getAllHeroes`, "get");
   }
 
   async levelUpHero(payload) {
     return this.makeRequest(`${this.baseURL}/levelUpHero`, "post", payload);
+  }
+
+  async starUpHero(payload) {
+    return this.makeRequest(`${this.baseURL}/starUpHero`, "post", payload);
   }
 
   async claimChallengesRewards() {
@@ -347,7 +361,7 @@ class ClientAPI {
   async handleUpgradeHeroes(data) {
     this.log(`Checking upgrade hero...`);
     let { heroes, resources } = data;
-    const { greenStones, gold } = resources;
+    const { greenStones, gold, heroCard } = resources;
     let goldAvailable = gold.amount,
       greenStonesAvailable = greenStones.amount;
 
@@ -359,7 +373,13 @@ class ClientAPI {
 
     const upgrades = heroes
       .map((hero) => {
-        let type;
+        let type,
+          cards = 0;
+        const item = heroCard.find((h) => h.heroType === hero.heroType);
+        if (item) {
+          cards = item.amount;
+        }
+
         if (hero.heroType.endsWith("3") || hero.heroType.endsWith("Legendary")) {
           type = "Legendary"; // Hậu tố 3 là Legendary
         } else if (hero.heroType.endsWith("2") || hero.heroType.endsWith("Epic")) {
@@ -370,20 +390,36 @@ class ClientAPI {
         return {
           ...hero,
           type,
+          cards,
         };
       })
       .filter(
         (h) =>
-          settings.TYPE_UPGRADE_HERO.includes(h.type) && h.unlockAt == 0 && h.level < settings.MAX_LEVEL_UGRADE_HERO && h.costLevelGreen <= greenStonesAvailable && h.costLevelGold <= goldAvailable
+          h.unlockAt == 0 &&
+          ((h.cards >= h.costStar && h.stars < h.maxStars) ||
+            (settings.TYPE_UPGRADE_HERO.includes(h.type) && h.level < settings.MAX_LEVEL_UGRADE_HERO && h.costLevelGreen <= greenStonesAvailable && h.costLevelGold <= goldAvailable))
       )
       .sort((a, b) => typeMapping[a.type] - typeMapping[b.type]);
     if (upgrades.length == 0) {
       return this.log(`No hero available to upgrade!`, "warning");
     }
     for (const hero of upgrades) {
+      //up level
+      if (hero.cards >= hero.costStar && hero.stars < hero.maxStars) {
+        const resUpStar = await this.starUpHero({
+          heroType: hero.heroType,
+        });
+        if (resUpStar.success) {
+          this.log(`Upgrade hero ${hero.name} to star ${hero.stars + 1} successful!`, "success");
+          data = resUpStar.data.player;
+        }
+      }
+
+      //up star
       if (hero.costLevelGreen > greenStonesAvailable || hero.costLevelGold > goldAvailable) continue;
       await sleep(1);
-      this.log(`Starting upgrade hero ${hero.name} | level ${hero.level}...`, "info");
+      this.log(`Starting upgrade hero ${hero.name} | level ${hero.level} | Star ${hero.stars}...`, "info");
+
       const resUp = await this.levelUpHero({
         heroType: hero.heroType,
       });
@@ -413,23 +449,81 @@ class ClientAPI {
     }
   }
 
+  async handleReff() {
+    const result = await this.getReff();
+    if (result.success) {
+      const { claimAvailible } = result.data;
+      if (claimAvailible) {
+        await this.claimReff();
+      }
+    }
+  }
+
   async handleGame(data) {
     let { meta, heroes } = data;
     heroes = heroes.filter((h) => h.unlockAt == 0).sort((a, b) => b.power - a.power);
-    const result = await this.getConstellations({
-      amount: 1,
-      startIndex: meta.constellationsLastIndex,
-    });
-    if (!result.success) return;
+    let result = {
+      success: false,
+      data: { constellations: [] },
+    };
+    let startIndexMap = settings.MAP_RANGE_CHALLENGE[0] - 1;
+    let endIndexMap = meta.constellationsLastIndex;
+    if (
+      settings.MAP_RANGE_CHALLENGE[1] == 0 ||
+      !settings.ENABLE_MAP_RANGE_CHALLENGE ||
+      (settings.MAP_RANGE_CHALLENGE[0] == 0 && settings.MAP_RANGE_CHALLENGE[1] == 0) ||
+      settings.MAP_RANGE_CHALLENGE[0] > settings.MAP_RANGE_CHALLENGE[1]
+    ) {
+      startIndexMap = meta.constellationsLastIndex;
+    } else {
+      endIndexMap = Math.min(meta.constellationsLastIndex, Math.max(0, settings.MAP_RANGE_CHALLENGE[1] - 1));
+    }
+    if (endIndexMap - startIndexMap > 10) {
+      this.log(`WARNING: Range map clear > 10 [Start at: ${endIndexMap} , End at: ${endIndexMap}]. Should be less than 10`);
+    }
+    for (let i = startIndexMap; i <= endIndexMap; i++) {
+      this.log(`Checking challenge map ${i + 1}`);
+      await sleep(2);
+      const res = await this.getConstellations({
+        amount: 1,
+        startIndex: i,
+      });
+      if (res.success) {
+        result = {
+          success: true,
+          data: { constellations: [...result.data.constellations, ...res.data.constellations] },
+        };
+      }
+    }
+
     const { constellations } = result.data;
+    if (!result.success || constellations.length == 0) return;
 
     if (constellations.length > 0) {
       for (const constellation of constellations) {
         this.log(`Starting game at map ${constellation.name}`);
-
-        for (const change of constellation.challenges) {
+        const challenges = constellation.challenges.filter((c) => c.received < c.value);
+        if (challenges.length == 0) {
+          this.log(
+            `You are proccessing challenge ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
+              constellation.name
+            }`,
+            "warning"
+          );
+          continue;
+        }
+        for (const change of challenges) {
           await sleep(1);
-          if (change.cooldown > 0 || Date.now() < change.unlockAt || change.received == change.value) continue;
+          if (Date.now() < change.unlockAt) {
+            const timeDifference = change.unlockAt - Date.now();
+            const seconds = Math.floor((timeDifference / 1000) % 60);
+            const minutes = Math.floor((timeDifference / (1000 * 60)) % 60);
+            const hours = Math.floor((timeDifference / (1000 * 60 * 60)) % 24);
+            this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name}...`.yellow);
+            continue;
+          }
+          if (change.cooldown > 0) continue;
+
           let orderedSlots = [];
           let orderedHeroId = [];
           let isPlay = true;
@@ -437,26 +531,35 @@ class ClientAPI {
             const slot = change.orderedSlots[index];
             if (!slot.unlocked) continue;
             // fs.writeFileSync("save.json", JSON.stringify(heroes, null, 2), "utf-8");
-            const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel);
-            // console.log("hero", change, hero);
-            //  h.skill == change.heroSkill;
+            const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel && h.stars >= change.minStars);
             if (hero) {
               orderedHeroId.push(hero.heroType);
               orderedSlots.push({
                 heroType: hero.heroType,
                 slotId: index,
+                skill: hero.skill,
               });
             } else {
-              isPlay = false;
-              this.log(`No hero avaliable to go change ${change.name}`, "warning");
-              break;
+              continue;
             }
           }
 
+          //check slot
+          const hasHeroMapSkill = orderedSlots.find((s) => s.skill == change.heroSkill);
+          if (orderedSlots.length == 0 && !hasHeroMapSkill) {
+            isPlay = false;
+            this.log(`No hero avaliable to go change ${change.name}`, "warning");
+          }
+
+          // let payload = {}
           if (isPlay) {
             let payload = {
               challengeType: change.challengeType,
               heroes: orderedSlots,
+            };
+            payload = {
+              ...payload,
+              heroes: payload.heroes.map((item) => ({ heroType: item.heroType, slotId: item.slotId })),
             };
             this.log(`Starting change ${change.name} | Reward received: ${change.received}/${change.value} ${change.resourceType} | Time: ${change.time} seconds...`);
             const resChange = await this.sendToChallenge(payload);
@@ -474,7 +577,7 @@ class ClientAPI {
   }
 
   async handleClan(data) {
-    const { clanInfo, meta } = data;
+    const { clanInfo } = data;
     if (clanInfo?.clanId) {
       this.log(`Joined clan ${clanInfo.name}!`, "warning");
       return;
@@ -494,14 +597,18 @@ class ClientAPI {
   }
 
   async handleCode() {
-    this.log(`Checking code...`);
+    this.log(`Checking gift code...`);
     const codes = settings.CODE_GATEWAY;
     for (const code of codes) {
       const result = await this.useRedeemCode(code);
       if (result.success) {
-        this.log(`Code ${code} sucessfully!`, "success");
+        let { rewards } = result.data;
+        rewards = Object.entries(rewards);
+        for (const reward of rewards) {
+          this.log(`Code ${code} sucessfully! | Reward: ${reward[1]?.amount} ${reward[0]}`, "success");
+        }
       } else {
-        this.log(`Code ${code} wrong or expried!`, "warning");
+        this.log(`Code ${code} wrong or expried or claimed!`, "warning");
       }
     }
   }
@@ -608,7 +715,7 @@ async function main() {
       });
       await Promise.allSettled(promises);
     }
-    updateEnv("AUTO_CODE_GATEWAY", "false");
+    await updateEnv("AUTO_CODE_GATEWAY", "false");
     await sleep(5);
     console.log(`Hoàn thành tất cả tài khoản | Chờ ${settings.TIME_SLEEP} phút=============`.magenta);
     if (settings.AUTO_SHOW_COUNT_DOWN_TIME_SLEEP) {
