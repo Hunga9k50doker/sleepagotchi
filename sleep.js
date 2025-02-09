@@ -17,8 +17,8 @@ class ClientAPI {
       "Accept-Encoding": "gzip, deflate, br",
       "Accept-Language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5",
       "Content-Type": "application/json",
-      Origin: "https://tg-sleepagotchi-tmp-cdn.sfo3.digitaloceanspaces.com",
-      referer: "https://tg-sleepagotchi-tmp-cdn.sfo3.digitaloceanspaces.com/",
+      Origin: "https://tgcf.sleepagotchi.com",
+      referer: "https://tgcf.sleepagotchi.com/",
       "Sec-Ch-Ua": '"Not/A)Brand";v="99", "Google Chrome";v="115", "Chromium";v="115"',
       "Sec-Ch-Ua-Mobile": "?0",
       "Sec-Ch-Ua-Platform": '"Windows"',
@@ -136,6 +136,9 @@ class ClientAPI {
         if (response.data) return { success: true, data: response.data };
         return { success: false, data: response.data };
       } catch (error) {
+        if (error.response && error.response.status == 404) {
+          return { success: false, error: error.message };
+        }
         if (error.status == 400) {
           return { success: false, error: error.message };
         }
@@ -235,6 +238,16 @@ class ClientAPI {
     return this.makeRequest(`${this.baseURL}/claimDailyRewards`, "get");
   }
 
+  async resetHero(heroType) {
+    return this.makeRequest(`${this.baseURL}/resetHero`, "post", { heroType: heroType });
+  }
+
+  async getClanDetail(id) {
+    return this.makeRequest(`${this.baseURL}/getClan`, "post", {
+      clanId: id,
+    });
+  }
+
   async getValidToken(isRf = false) {
     const userId = this.session_name;
     const existingToken = this.token;
@@ -272,37 +285,6 @@ class ClientAPI {
     return { access_token: null, refresh_token: null };
   }
 
-  async handleTasks() {
-    const resTasks = await this.missionLists();
-    if (resTasks.success) {
-      const tasks = resTasks.data.filter((task) => !settings.SKIP_TASKS.includes(task.id) && !task.claimed_at);
-      if (tasks.length == 0) {
-        return this.log(`No tasks to do!`, "warning");
-      }
-      for (const task of tasks) {
-        this.log(`Completting task ID: ${task.id} | Title: ${task.name}...`);
-        await sleep(1);
-        const { client_tasks } = task;
-
-        try {
-          if (client_tasks[1] && client_tasks[1].type == "WAIT") {
-            this.log(`Waiting for ${client_tasks[1].payload} seconds to claim the task...`);
-            await sleep(client_tasks[1].payload);
-          }
-        } catch (error) {}
-
-        const resClaim = await this.missionClaim(task.id);
-        if (resClaim.success) {
-          this.log(`Completed task ${task.id} | ${task.name} successfully!`, "success");
-        } else {
-          this.log(`Completed task ${task.id} | ${task.name} failed!`, "warning");
-        }
-      }
-    } else {
-      this.log(`Can't get tasks.`, "warning");
-    }
-  }
-
   async handleDaily(data) {
     const { meta } = data;
     if (!meta.isNextDailyRewardAvailable) return this.log(`You checked in today!`, "warning");
@@ -331,7 +313,7 @@ class ClientAPI {
         strategy: "free",
       });
       if (resGacha.success) {
-        for (const hero of resGacha.data.heroCard) this.log(`Gacha free success! Reward: ${hero.amount} ${hero.heroType}`, "custom");
+        for (const hero of resGacha.data.heroes) this.log(`Gacha free success! Reward: ${hero.heroType}`, "custom");
       }
     }
 
@@ -351,14 +333,74 @@ class ClientAPI {
         totalTicket--;
       }
       if (resGacha.success) {
-        for (const hero of resGacha.data.heroCard) this.log(`Gacha success! Reward: ${hero.amount} ${hero.heroType}`, "custom");
+        for (const hero of resGacha.data.heroes) this.log(`Gacha success! Reward: ${hero.heroType}`, "custom");
       }
     }
 
     return;
   }
 
+  async handleResetHeroes(data) {
+    this.log(`Checking hero to reset...`);
+    let { heroes, resources } = data;
+    const { greenStones, gold, gem } = resources;
+    let goldAvailable = gold.amount,
+      gemAvailable = gem.amount,
+      greenStonesAvailable = greenStones.amount;
+
+    const resets = heroes
+      .map((hero) => {
+        let type;
+        if (hero.heroType.endsWith("3") || hero.heroType.endsWith("Legendary")) {
+          type = "Legendary"; // Hậu tố 3 là Legendary
+        } else if (hero.heroType.endsWith("2") || hero.heroType.endsWith("Epic")) {
+          type = "Epic"; // Hậu tố 2 là Epic
+        } else {
+          type = "Rare"; // Hậu tố Rare
+        }
+        return {
+          ...hero,
+          type,
+        };
+      })
+      .filter((h) => settings.TYPE_HERO_RESET.includes(h.type) && h.level > 1);
+
+    if (resets.length == 0) {
+      this.log(`No hero available to reset!`, "warning");
+      return data;
+    }
+    for (const hero of resets) {
+      if (gem.amount < 100) {
+        this.log(`Not enough Gem to reset!`, "warning");
+        return data;
+      }
+      await sleep(1);
+      this.log(`Resetting hero ${hero.name} | type: ${hero.type}...`);
+      const result = await this.resetHero(hero.heroType);
+
+      if (result.success) {
+        const { rewards } = result.data;
+        greenStonesAvailable = greenStonesAvailable + rewards.greenStones.amount;
+        goldAvailable = goldAvailable + rewards.gold.amount;
+        gemAvailable -= 100;
+        const newHereos = heroes.filter((h) => h.heroType !== result.data.heroType);
+        data["heroes"] = [...newHereos, result.data];
+        this.log(`Reset hero ${hero.name} successful! | Green stone: ${greenStonesAvailable} | Gold: ${goldAvailable} | Gem: ${gemAvailable}`, "success");
+      } else {
+        this.log(`Reset hero ${hero.name} failed!`, "warning");
+      }
+    }
+    const { data: userInfo } = await this.getUserInfo();
+    if (userInfo) {
+      return userInfo.player;
+    }
+    return data;
+  }
+
   async handleUpgradeHeroes(data) {
+    // const { data: userInfo } = await this.getUserInfo();
+    // if (!userInfo) return;
+    // data = userInfo.player;
     this.log(`Checking upgrade hero...`);
     let { heroes, resources } = data;
     const { greenStones, gold, heroCard } = resources;
@@ -397,26 +439,27 @@ class ClientAPI {
         (h) =>
           h.unlockAt == 0 &&
           ((h.cards >= h.costStar && h.stars < h.maxStars) ||
-            (settings.TYPE_UPGRADE_HERO.includes(h.type) && h.level < settings.MAX_LEVEL_UGRADE_HERO && h.costLevelGreen <= greenStonesAvailable && h.costLevelGold <= goldAvailable))
+            (settings.TYPE_HERO_UPGRADE.includes(h.type) && h.level < settings.MAX_LEVEL_UGRADE_HERO && h.costLevelGreen <= greenStonesAvailable && h.costLevelGold <= goldAvailable))
       )
       .sort((a, b) => typeMapping[a.type] - typeMapping[b.type]);
     if (upgrades.length == 0) {
       return this.log(`No hero available to upgrade!`, "warning");
     }
     for (const hero of upgrades) {
-      //up level
+      //up start
       if (hero.cards >= hero.costStar && hero.stars < hero.maxStars) {
         const resUpStar = await this.starUpHero({
           heroType: hero.heroType,
         });
         if (resUpStar.success) {
           this.log(`Upgrade hero ${hero.name} to star ${hero.stars + 1} successful!`, "success");
-          data = resUpStar.data.player;
+          const newHereos = upgrades.filter((h) => h.heroType !== resUpStar.data.heroType);
+          data["heroes"] = [...newHereos, resUpStar.data];
         }
       }
 
-      //up star
-      if (hero.costLevelGreen > greenStonesAvailable || hero.costLevelGold > goldAvailable) continue;
+      //up level
+      if (hero.costLevelGreen > greenStonesAvailable || hero.costLevelGold > goldAvailable || hero.level >= settings.MAX_LEVEL_UGRADE_HERO) continue;
       await sleep(1);
       this.log(`Starting upgrade hero ${hero.name} | level ${hero.level} | Star ${hero.stars}...`, "info");
 
@@ -428,13 +471,18 @@ class ClientAPI {
         this.log(`Upgrade hero ${hero.name} to level ${hero.level + 1} successful!`, "success");
         greenStonesAvailable -= hero.costLevelGreen;
         goldAvailable -= hero.costLevelGold;
-        data = resUp.data.player;
+        const newHereos = upgrades.filter((h) => h.heroType !== resUp.data.hero.heroType);
+        data["heroes"] = [...newHereos, resUp.data.hero];
       } else {
         this.log(`Upgrade hero ${hero.name} failed!`, "warning");
       }
     }
 
-    return await this.handleUpgradeHeroes(data);
+    // const { data: userInfo } = await this.getUserInfo();
+    // if (userInfo) {
+    // }
+    return data;
+    // return await this.handleUpgradeHeroes(data);
   }
 
   async handleShop() {
@@ -467,7 +515,7 @@ class ClientAPI {
       data: { constellations: [] },
     };
     let startIndexMap = settings.MAP_RANGE_CHALLENGE[0] - 1;
-    let endIndexMap = meta.constellationsLastIndex;
+    let endIndexMap = startIndexMap + 10;
     if (
       settings.MAP_RANGE_CHALLENGE[1] == 0 ||
       !settings.ENABLE_MAP_RANGE_CHALLENGE ||
@@ -478,98 +526,187 @@ class ClientAPI {
     } else {
       endIndexMap = Math.min(meta.constellationsLastIndex, Math.max(0, settings.MAP_RANGE_CHALLENGE[1] - 1));
     }
-    if (endIndexMap - startIndexMap > 10) {
-      this.log(`WARNING: Range map clear > 10 [Start at: ${endIndexMap} , End at: ${endIndexMap}]. Should be less than 10`);
+    // if (endIndexMap - startIndexMap > 10) {
+    //   this.log(`WARNING: Range map clear > 10 [Start at: ${endIndexMap} , End at: ${endIndexMap}]. Should be less than 10`);
+    // }
+    this.log(`Checking challenge map from  ${startIndexMap + 1} to ${startIndexMap + 11}`);
+    await sleep(2);
+    const res = await this.getConstellations({
+      amount: 10,
+      startIndex: startIndexMap,
+    });
+    if (res.success) {
+      result = {
+        success: true,
+        data: { constellations: [...result.data.constellations, ...res.data.constellations] },
+      };
     }
-    for (let i = startIndexMap; i <= endIndexMap; i++) {
-      this.log(`Checking challenge map ${i + 1}`);
-      await sleep(2);
-      const res = await this.getConstellations({
-        amount: 1,
-        startIndex: i,
-      });
-      if (res.success) {
-        result = {
-          success: true,
-          data: { constellations: [...result.data.constellations, ...res.data.constellations] },
-        };
-      }
-    }
+    // for (let i = startIndexMap; i <= endIndexMap; i++) {
+    // }
 
     const { constellations } = result.data;
     if (!result.success || constellations.length == 0) return;
 
-    if (constellations.length > 0) {
-      for (const constellation of constellations) {
-        this.log(`Starting game at map ${constellation.name}`);
-        const challenges = constellation.challenges.filter((c) => c.received < c.value);
-        if (challenges.length == 0) {
-          this.log(
-            `You are proccessing challenge ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
-              constellation.name
-            }`,
-            "warning"
-          );
+    for (const constellation of constellations) {
+      this.log(`Starting challenge at map ${constellation.name}`);
+      const challenges = constellation.challenges.filter((c) => c.received < c.value);
+      if (challenges.length == 0) {
+        // this.log(
+        //   `You are proccessing challenge ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
+        //     constellation.name
+        //   }`,
+        //   "warning"
+        // );
+        continue;
+      }
+      for (const change of challenges) {
+        await sleep(1);
+        if (Date.now() < change.unlockAt) {
+          const timeDifference = change.unlockAt - Date.now();
+          const seconds = Math.floor((timeDifference / 1000) % 60);
+          const minutes = Math.floor((timeDifference / (1000 * 60)) % 60);
+          const hours = Math.floor((timeDifference / (1000 * 60 * 60)) % 24);
+          this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name} | Map ${constellation.name}...`.yellow);
           continue;
         }
-        for (const change of challenges) {
-          await sleep(1);
-          if (Date.now() < change.unlockAt) {
-            const timeDifference = change.unlockAt - Date.now();
-            const seconds = Math.floor((timeDifference / 1000) % 60);
-            const minutes = Math.floor((timeDifference / (1000 * 60)) % 60);
-            const hours = Math.floor((timeDifference / (1000 * 60 * 60)) % 24);
-            this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name}...`.yellow);
+        if (change.cooldown > 0) continue;
+
+        let orderedSlots = [];
+        let orderedHeroId = [];
+        let isPlay = true;
+        for (let index = 0; index < change.orderedSlots.length; index++) {
+          const slot = change.orderedSlots[index];
+          if (!slot.unlocked) continue;
+          // fs.writeFileSync("save.json", JSON.stringify(heroes, null, 2), "utf-8");
+          const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel && h.stars >= change.minStars);
+          if (hero) {
+            orderedHeroId.push(hero.heroType);
+            orderedSlots.push({
+              heroType: hero.heroType,
+              slotId: index,
+              skill: hero.skill,
+            });
+          } else {
             continue;
           }
-          if (change.cooldown > 0) continue;
+        }
 
-          let orderedSlots = [];
-          let orderedHeroId = [];
-          let isPlay = true;
-          for (let index = 0; index < change.orderedSlots.length; index++) {
-            const slot = change.orderedSlots[index];
-            if (!slot.unlocked) continue;
-            // fs.writeFileSync("save.json", JSON.stringify(heroes, null, 2), "utf-8");
-            const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel && h.stars >= change.minStars);
-            if (hero) {
-              orderedHeroId.push(hero.heroType);
-              orderedSlots.push({
-                heroType: hero.heroType,
-                slotId: index,
-                skill: hero.skill,
-              });
-            } else {
-              continue;
-            }
+        //check slot
+        const hasHeroMapSkill = orderedSlots.find((s) => s.skill.slice(0, -1) == change.heroSkill.slice(0, -1));
+        if (orderedSlots.length == 0 && !hasHeroMapSkill) {
+          isPlay = false;
+          this.log(`No hero avaliable to go change ${change.name}`, "warning");
+        }
+
+        // let payload = {}
+        if (isPlay) {
+          let payload = {
+            challengeType: change.challengeType,
+            heroes: orderedSlots,
+          };
+          payload = {
+            ...payload,
+            heroes: payload.heroes.map((item) => ({ heroType: item.heroType, slotId: item.slotId })),
+          };
+          this.log(`Starting change ${change.name} | Reward received: ${change.received}/${change.value} ${change.resourceType} | Time: ${change.time} seconds...`);
+          const resChange = await this.sendToChallenge(payload);
+          if (resChange.success) {
+            this.log(`Started change ${change.name} | Reward ${change.resourceType} successfully`, "success");
+            heroes = heroes.filter((hero) => !payload.heroes.some((excluded) => excluded.heroType === hero.heroType));
+          } else {
+            this.log(`Started change ${change.name} failed`, "warning");
+            console.log(resChange);
           }
+        }
+      }
+    }
+  }
 
-          //check slot
-          const hasHeroMapSkill = orderedSlots.find((s) => s.skill == change.heroSkill);
-          if (orderedSlots.length == 0 && !hasHeroMapSkill) {
-            isPlay = false;
-            this.log(`No hero avaliable to go change ${change.name}`, "warning");
+  async handleChallengeClan(data) {
+    let { heroes, clanInfo } = data;
+    let { clanId } = clanInfo;
+    if (!clanId) {
+      clanId = this.handleClan(data);
+    }
+    if (!clanId) {
+      return this.log(`You did not join in any clan!`, "warning");
+    }
+
+    const resClan = await this.getClanDetail(clanId);
+    if (!resClan.success) return this.log(`Can't get info clan!`, "warning");
+    heroes = heroes.filter((h) => h.unlockAt == 0).sort((a, b) => b.power - a.power);
+    let { constellations } = resClan.data;
+    constellations = constellations.filter((i) => i.progress < 100);
+    if (constellations.length == 0) return;
+    for (const constellation of constellations) {
+      this.log(`Starting challenge clan at map ${constellation.name}`);
+      const challenges = constellation.challenges.filter((c) => c.received < c.value);
+      if (challenges.length == 0) {
+        // this.log(
+        //   `You are proccessing challenge clan ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
+        //     constellation.name
+        //   }`,
+        //   "warning"
+        // );
+        continue;
+      }
+      for (const change of challenges) {
+        await sleep(1);
+        if (Date.now() < change.unlockAt) {
+          const timeDifference = change.unlockAt - Date.now();
+          const seconds = Math.floor((timeDifference / 1000) % 60);
+          const minutes = Math.floor((timeDifference / (1000 * 60)) % 60);
+          const hours = Math.floor((timeDifference / (1000 * 60 * 60)) % 24);
+          this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name}...`.yellow);
+          continue;
+        }
+        if (change.cooldown > 0) continue;
+
+        let orderedSlots = [];
+        let orderedHeroId = [];
+        let isPlay = true;
+        for (let index = 0; index < change.orderedSlots.length; index++) {
+          const slot = change.orderedSlots[index];
+          if (!slot.unlocked) continue;
+          // fs.writeFileSync("save.json", JSON.stringify(heroes, null, 2), "utf-8");
+          const hero = heroes.find((h) => !orderedHeroId.includes(h.heroType) && (slot.optional ? true : h.class == slot.heroClass) && h.level >= change.minLevel && h.stars >= change.minStars);
+          if (hero) {
+            orderedHeroId.push(hero.heroType);
+            orderedSlots.push({
+              heroType: hero.heroType,
+              slotId: index,
+              skill: hero.skill,
+            });
+          } else {
+            continue;
           }
+        }
 
-          // let payload = {}
-          if (isPlay) {
-            let payload = {
-              challengeType: change.challengeType,
-              heroes: orderedSlots,
-            };
-            payload = {
-              ...payload,
-              heroes: payload.heroes.map((item) => ({ heroType: item.heroType, slotId: item.slotId })),
-            };
-            this.log(`Starting change ${change.name} | Reward received: ${change.received}/${change.value} ${change.resourceType} | Time: ${change.time} seconds...`);
-            const resChange = await this.sendToChallenge(payload);
-            if (resChange.success) {
-              this.log(`Started change ${change.name} | Reward ${change.resourceType} successfully`, "success");
-              heroes = resChange.data.player.heroes.filter((h) => h.unlockAt == 0).sort((a, b) => b.power - a.power);
-            } else {
-              this.log(`Started change ${change.name} failed`, "warning");
-              console.log(resChange);
-            }
+        //check slot
+        const hasHeroMapSkill = orderedSlots.find((s) => s.skill.slice(0, -1) == change.heroSkill.slice(0, -1));
+        if (orderedSlots.length == 0 && !hasHeroMapSkill) {
+          isPlay = false;
+          this.log(`No hero avaliable to go challenge clan ${change.name}`, "warning");
+        }
+
+        // let payload = {}
+        if (isPlay) {
+          let payload = {
+            challengeType: change.challengeType,
+            heroes: orderedSlots,
+          };
+          payload = {
+            ...payload,
+            heroes: payload.heroes.map((item) => ({ heroType: item.heroType, slotId: item.slotId })),
+          };
+          this.log(`Starting challenge clan ${change.name} | Reward received: ${change.received}/${change.value} ${change.resourceType} | Time: ${change.time} seconds...`);
+          const resChange = await this.sendToChallenge(payload);
+          if (resChange.success) {
+            this.log(`Started challenge clan ${change.name} | Reward ${change.resourceType} successfully`, "success");
+            heroes = heroes.filter((hero) => !payload.heroes.some((excluded) => excluded.heroType === hero.heroType));
+          } else {
+            this.log(`Started challenge clan ${change.name} failed`, "warning");
+            console.log(resChange);
           }
         }
       }
@@ -580,7 +717,7 @@ class ClientAPI {
     const { clanInfo } = data;
     if (clanInfo?.clanId) {
       this.log(`Joined clan ${clanInfo.name}!`, "warning");
-      return;
+      return clanInfo.clanId;
     }
     const result = await this.getClans();
     if (!result.success) return;
@@ -592,8 +729,10 @@ class ClientAPI {
       const resJoin = await this.joinClan(clan.id);
       if (resJoin.success) {
         this.log(`Join clan ${clan.name} sucessfully!`, "success");
+        return clan.id;
       }
     }
+    return null;
   }
 
   async handleCode() {
@@ -626,6 +765,7 @@ class ClientAPI {
       }
     }
   }
+
   async processAccount() {
     let userData = { success: false },
       retries = 0;
@@ -637,10 +777,10 @@ class ClientAPI {
 
     // process.exit(0);
     if (userData.success) {
-      const { initData, player, verified } = userData.data;
+      let { username, player, verified } = userData.data;
       const { resources } = player;
       this.log(
-        `Username: ${initData.username} | Gem: ${resources.gem.amount} | Gold: ${resources.gold.amount} | Green stone: ${resources.greenStones.amount} | Purple stone: ${
+        `Username: ${username} | Gem: ${resources.gem.amount} | Gold: ${resources.gold.amount} | Green stone: ${resources.greenStones.amount} | Purple stone: ${
           resources.purpleStones.amount
         } | Verified: ${verified.toString()}`
       );
@@ -649,7 +789,7 @@ class ClientAPI {
         await this.handleCode();
       }
 
-      await this.handleDaily(player);
+      // await this.handleDaily(player);
       await sleep(1);
       await this.handleClaim(player);
       await sleep(1);
@@ -659,9 +799,19 @@ class ClientAPI {
 
       await this.handleClan(player);
 
+      if (settings.AUTO_RESET_HERO) {
+        await sleep(1);
+        player = await this.handleResetHeroes(player);
+      }
+
       if (settings.AUTO_UGRADE_HERO) {
         await sleep(1);
         await this.handleUpgradeHeroes(player);
+      }
+
+      if (settings.AUTO_CHALLENGE_CLAN) {
+        await sleep(2);
+        await this.handleChallengeClan(player);
       }
 
       if (settings.AUTO_CHALLENGE) {
