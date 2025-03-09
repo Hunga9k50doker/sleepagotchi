@@ -11,7 +11,7 @@ const { Worker, isMainThread, parentPort, workerData } = require("worker_threads
 const { checkBaseUrl } = require("./checkAPI");
 
 class ClientAPI {
-  constructor(queryId, accountIndex, proxy, baseURL) {
+  constructor(queryId, accountIndex, proxy, baseURL, tokens) {
     this.headers = {
       Accept: "*/*",
       "Accept-Encoding": "gzip, deflate, br",
@@ -34,6 +34,8 @@ class ClientAPI {
     this.proxyIP = null;
     this.session_name = null;
     this.session_user_agents = this.#load_session_data();
+    this.tokens = tokens;
+    this.token = null;
   }
 
   #load_session_data() {
@@ -108,11 +110,12 @@ class ClientAPI {
   }
 
   async log(msg, type = "info") {
-    const timestamp = new Date().toLocaleTimeString();
     const accountPrefix = `[Tài khoản ${this.accountIndex + 1}]`;
-    const ipPrefix = this.proxyIP ? `[${this.proxyIP}]` : "[Unknown IP]";
+    let ipPrefix = this.proxyIP ? `[${this.proxyIP}]` : "[Local IP]";
     let logMessage = "";
-
+    if (settings.USE_PROXY) {
+      ipPrefix = this.proxyIP ? `[${this.proxyIP}]` : "[Unknown IP]";
+    }
     switch (type) {
       case "success":
         logMessage = `${accountPrefix}${ipPrefix} ${msg}`.green;
@@ -147,39 +150,79 @@ class ClientAPI {
     }
   }
 
-  async makeRequest(url, method, data = {}, retries = 1) {
+  async makeRequest(
+    url,
+    method,
+    data = {},
+    options = {
+      retries: 1,
+      isAuth: false,
+    }
+  ) {
+    const { retries, isAuth } = options;
+
     const headers = {
       ...this.headers,
     };
-    const proxyAgent = new HttpsProxyAgent(this.proxy);
+
+    if (!isAuth) {
+      headers["authorization"] = `Bearer ${this.token}`;
+    }
+
+    let proxyAgent = null;
+    if (settings.USE_PROXY) {
+      proxyAgent = new HttpsProxyAgent(this.proxy);
+    }
     let currRetries = 0,
       success = false;
     do {
       try {
         const response = await axios({
           method,
-          url: `${url}?${this.queryId}`,
+          url: `${url}`,
           data,
           headers,
-          httpsAgent: proxyAgent,
           timeout: 30000,
+          ...(proxyAgent ? { httpsAgent: proxyAgent } : {}),
         });
         success = true;
-        return { success: true, data: response.data };
+        if (response?.data?.data) return { status: response.status, success: true, data: response.data.data };
+        return { success: true, data: response.data, status: response.status };
       } catch (error) {
-        if (error.response && error.response.status == 404) {
-          return { success: false, error: error.message };
+        if (error.message.includes("stream has been aborted")) {
+          return { success: false, status: error.status, data: null, error: error.response.data.error || error.response.data.message || error.message };
+        }
+        if (error.status == 401) {
+          const token = await this.getValidToken(true);
+          if (!token) {
+            process.exit(1);
+          }
+          this.token = token;
+          return await this.makeRequest(url, method, data, options);
         }
         if (error.status == 400) {
-          return { success: false, error: error.message };
+          this.log(`Invalid request for ${url}, maybe have new update from server | contact: https://t.me/airdrophuntersieutoc to get new update!`, "error");
+          return { success: false, status: error.status, error: error.response.data.error || error.response.data.message || error.message };
         }
         this.log(`Yêu cầu thất bại: ${url} | ${error.message} | đang thử lại...`, "warning");
         success = false;
         await sleep(settings.DELAY_BETWEEN_REQUESTS);
-        if (currRetries == retries) return { success: false, error: error.message };
+        if (currRetries == retries) return { status: error.status, success: false, error: error.message };
       }
       currRetries++;
     } while (currRetries <= retries && !success);
+  }
+
+  async auth() {
+    return this.makeRequest(
+      `${this.baseURL}/login`,
+      "post",
+      {
+        loginType: "tg",
+        payload: this.queryId,
+      },
+      { isAuth: true }
+    );
   }
 
   async getUserInfo() {
@@ -279,41 +322,22 @@ class ClientAPI {
     });
   }
 
-  async getValidToken(isRf = false) {
-    const userId = this.session_name;
+  async getValidToken(isNew = false) {
     const existingToken = this.token;
-    const existingRefreshToken = this.rfToken;
-    let loginResult = null;
-
-    const isExp = isTokenExpired(!isRf ? existingToken : existingRefreshToken);
-    if (!isRf && existingToken && !isExp) {
+    const isExp = isTokenExpired(existingToken);
+    if (existingToken && !isNew && !isExp) {
       this.log("Using valid token", "success");
-      return { access_token: existingToken, refresh_token: existingRefreshToken };
-    } else if (!isRf && existingToken && isExp) {
-      this.log("Token expired, refreshing token...", "info");
-      return await this.getValidToken(true);
-    } else if (isRf && existingRefreshToken && !isExp) {
-      loginResult = await this.refreshToken();
+      return existingToken;
     } else {
-      this.log("Token not found or expired, logging in...", "warning");
-      loginResult = await this.auth();
-    }
-    // console.log(loginResult);
-    if (loginResult?.success) {
-      const { refresh_token, access_token } = loginResult?.data;
-      if (access_token) {
-        saveToken(userId, access_token);
-        this.token = access_token;
+      this.log("No found token or experied, trying get new token...", "warning");
+      const newToken = await this.auth();
+      if (newToken.success && newToken.data?.accessToken) {
+        saveJson(this.session_name, newToken.data.accessToken, "tokens.json");
+        return newToken.data.accessToken;
       }
-      if (refresh_token) {
-        saveJson(userId, refresh_token, "refresh_token.json");
-        this.rfToken = refresh_token;
-      }
-      return { access_token: access_token, refresh_token: refresh_token };
-    } else {
-      this.log(`Can't get token, try get new query_id!`, "warning");
+      this.log("Can't get new token...", "warning");
+      return null;
     }
-    return { access_token: null, refresh_token: null };
   }
 
   async handleDaily(data) {
@@ -546,21 +570,12 @@ class ClientAPI {
       success: false,
       data: { constellations: [] },
     };
-    let startIndexMap = settings.MAP_RANGE_CHALLENGE[0] - 1;
-    let endIndexMap = startIndexMap + 10;
-    if (
-      settings.MAP_RANGE_CHALLENGE[1] == 0 ||
-      !settings.ENABLE_MAP_RANGE_CHALLENGE ||
-      (settings.MAP_RANGE_CHALLENGE[0] == 0 && settings.MAP_RANGE_CHALLENGE[1] == 0) ||
-      settings.MAP_RANGE_CHALLENGE[0] > settings.MAP_RANGE_CHALLENGE[1]
-    ) {
+    let startIndexMap = settings.START_MAP_CHALLENGE_INDEX - 1;
+    if (!settings.ENABLE_MAP_INDEX_CHALLENGE) {
       startIndexMap = meta.constellationsLastIndex;
     } else {
-      endIndexMap = Math.min(meta.constellationsLastIndex, Math.max(0, settings.MAP_RANGE_CHALLENGE[1] - 1));
+      startIndexMap = Math.min(meta.constellationsLastIndex, Math.max(0, startIndexMap - 1));
     }
-    // if (endIndexMap - startIndexMap > 10) {
-    //   this.log(`WARNING: Range map clear > 10 [Start at: ${endIndexMap} , End at: ${endIndexMap}]. Should be less than 10`);
-    // }
     this.log(`Checking challenge map from  ${startIndexMap + 1} to ${startIndexMap + 11}`);
     await sleep(2);
     const res = await this.getConstellations({
@@ -573,8 +588,6 @@ class ClientAPI {
         data: { constellations: [...result.data.constellations, ...res.data.constellations] },
       };
     }
-    // for (let i = startIndexMap; i <= endIndexMap; i++) {
-    // }
 
     const { constellations } = result.data;
     if (!result.success || constellations.length == 0) return;
@@ -583,12 +596,6 @@ class ClientAPI {
       this.log(`Starting challenge at map ${constellation.name}`);
       const challenges = constellation.challenges.filter((c) => c.received < c.value);
       if (challenges.length == 0) {
-        // this.log(
-        //   `You are proccessing challenge ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
-        //     constellation.name
-        //   }`,
-        //   "warning"
-        // );
         continue;
       }
       for (const change of challenges) {
@@ -674,12 +681,6 @@ class ClientAPI {
       this.log(`Starting challenge clan at map ${constellation.name}`);
       const challenges = constellation.challenges.filter((c) => c.received < c.value);
       if (challenges.length == 0) {
-        // this.log(
-        //   `You are proccessing challenge clan ${startIndexMap == endIndexMap ? `at map ${endIndexMap + 1}` : `from map ${startIndexMap + 1} to ${endIndexMap + 1}`} | No challenge to go at map ${
-        //     constellation.name
-        //   }`,
-        //   "warning"
-        // );
         continue;
       }
       for (const change of challenges) {
@@ -799,25 +800,26 @@ class ClientAPI {
   }
 
   async runAccount() {
-    try {
-      this.proxyIP = await this.checkProxyIP();
-    } catch (error) {
-      this.log(`Cannot check proxy IP: ${error.message}`, "warning");
-      return;
-    }
-
     const accountIndex = this.accountIndex;
     const initData = this.queryId;
     const queryData = JSON.parse(decodeURIComponent(initData.split("user=")[1].split("&")[0]));
-    const firstName = queryData.first_name || "";
-    const lastName = queryData.last_name || "";
     this.session_name = queryData.id;
+    this.token = this.tokens[this.session_name];
+    if (settings.USE_PROXY) {
+      try {
+        this.proxyIP = await this.checkProxyIP();
+      } catch (error) {
+        this.log(`Cannot check proxy IP: ${error.message}`, "warning");
+        return;
+      }
+      const timesleep = getRandomNumber(settings.DELAY_START_BOT[0], settings.DELAY_START_BOT[1]);
+      console.log(`=========Tài khoản ${accountIndex + 1} | ${this.proxyIP} | Bắt đầu sau ${timesleep} giây...`.green);
+      await sleep(timesleep);
+    }
 
-    const timesleep = getRandomNumber(settings.DELAY_START_BOT[0], settings.DELAY_START_BOT[1]);
-    console.log(`=========Tài khoản ${accountIndex + 1}| ${firstName + " " + lastName} | ${this.proxyIP} | Bắt đầu sau ${timesleep} giây...`.green);
-    this.#set_headers();
-    await sleep(timesleep);
-
+    let token = await this.getValidToken();
+    if (!token) return;
+    this.token = token;
     let userData = { success: false },
       retries = 0;
     do {
@@ -876,8 +878,8 @@ class ClientAPI {
 }
 
 async function runWorker(workerData) {
-  const { queryId, accountIndex, proxy, hasIDAPI } = workerData;
-  const to = new ClientAPI(queryId, accountIndex, proxy, hasIDAPI);
+  const { queryId, accountIndex, proxy, hasIDAPI, tokens } = workerData;
+  const to = new ClientAPI(queryId, accountIndex, proxy, hasIDAPI, tokens);
   try {
     await Promise.race([to.runAccount(), new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 24 * 60 * 60 * 1000))]);
     parentPort.postMessage({
@@ -893,23 +895,27 @@ async function runWorker(workerData) {
 }
 
 async function main() {
+  console.log("Tool được phát triển bởi nhóm tele Airdrop Hunter Siêu Tốc (https://t.me/airdrophuntersieutoc)".yellow);
   const queryIds = loadData("data.txt");
   const proxies = loadData("proxy.txt");
+  const tokens = require("./tokens.json");
 
-  if (queryIds.length > proxies.length) {
+  if (queryIds.length == 0 || (queryIds.length > proxies.length && settings.USE_PROXY)) {
     console.log("Số lượng proxy và data phải bằng nhau.".red);
     console.log(`Data: ${queryIds.length}`);
     console.log(`Proxy: ${proxies.length}`);
     process.exit(1);
   }
-  console.log("Tool được phát triển bởi nhóm tele Airdrop Hunter Siêu Tốc (https://t.me/airdrophuntersieutoc)".yellow);
-  let maxThreads = settings.MAX_THEADS;
+  if (!settings.USE_PROXY) {
+    console.log(`You are running bot without proxies!!!`.yellow);
+  }
+  let maxThreads = settings.USE_PROXY ? settings.MAX_THEADS : settings.MAX_THEADS_NO_PROXY;
 
   const { endpoint: hasIDAPI, message } = await checkBaseUrl();
   if (!hasIDAPI) return console.log(`Không thể tìm thấy ID API, thử lại sau!`.red);
   console.log(`${message}`.yellow);
   // process.exit();
-  queryIds.map((val, i) => new ClientAPI(val, i, proxies[i], hasIDAPI).createUserAgent());
+  queryIds.map((val, i) => new ClientAPI(val, i, proxies[i], hasIDAPI, tokens).createUserAgent());
 
   await sleep(1);
   while (true) {
@@ -925,7 +931,8 @@ async function main() {
             hasIDAPI,
             queryId: queryIds[currentIndex],
             accountIndex: currentIndex,
-            proxy: proxies[currentIndex % proxies.length],
+            proxy: proxies[currentIndex],
+            tokens: tokens,
           },
         });
 
