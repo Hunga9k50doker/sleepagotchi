@@ -198,7 +198,12 @@ class ClientAPI {
             process.exit(1);
           }
           this.token = token;
-          return await this.makeRequest(url, method, data, options);
+          if (retries > 0)
+            return await this.makeRequest(url, method, data, {
+              ...options,
+              retries: 0,
+            });
+          else return { success: false, status: error.status, error: error.response.data.error || error.response.data.message || error.message };
         }
         if (error.status == 400) {
           this.log(`Invalid request for ${url}, maybe have new update from server | contact: https://t.me/airdrophuntersieutoc to get new update!`, "error");
@@ -241,6 +246,18 @@ class ClientAPI {
 
   async getAllHeroes() {
     return this.makeRequest(`${this.baseURL}/getAllHeroes`, "get");
+  }
+
+  async getMissions() {
+    return this.makeRequest(`${this.baseURL}/getMissions`, "get");
+  }
+
+  async doMissions(payload) {
+    return this.makeRequest(`${this.baseURL}/reportMissionEvent`, "post", payload);
+  }
+
+  async claimMissions(payload) {
+    return this.makeRequest(`${this.baseURL}/claimMission`, "post", payload);
   }
 
   async levelUpHero(payload) {
@@ -562,6 +579,31 @@ class ClientAPI {
     }
   }
 
+  async handleMissions() {
+    const result = await this.getMissions();
+    if (!result.success) return this.log(`Can not get mission`, "warning");
+    const missions = result.data.missions.filter((mission) => !mission.claimed && !settings.SKIP_TASKS.includes(mission.missionKey));
+    if (missions.length == 0) return this.log(`No mission available`, "warning");
+    for (const mission of missions) {
+      if (!mission.available) {
+        this.log(`Starting mission: ${mission.missionKey}...`);
+        const res = await this.doMissions({ missionKey: mission.missionKey });
+        if (!res.success) {
+          this.log(`Do mission: ${mission.missionKey} failed! | ${JSON.stringify(res)}`, "warning");
+          continue;
+        }
+      }
+      this.log(`Claiming mission: ${mission.missionKey} successful!`, "success");
+      const resClaim = await this.claimMissions({ missionKey: mission.missionKey });
+      if (!resClaim.success) {
+        this.log(`Claim mission: ${mission.missionKey} failed! | ${JSON.stringify(resClaim)}`, "warning");
+        continue;
+      } else {
+        this.log(`Claim mission: ${mission.missionKey} successful! | Reward: ${JSON.stringify(mission.rewards)}`, "success");
+      }
+    }
+  }
+
   async handleGame(data) {
     let { meta, heroes } = data;
     heroes = heroes.filter((h) => h.unlockAt == 0).sort((a, b) => b.power - a.power);
@@ -851,6 +893,11 @@ class ClientAPI {
 
       await this.handleClan(player);
 
+      if (settings.AUTO_TASK) {
+        await sleep(2);
+        await this.handleMissions();
+      }
+
       if (settings.AUTO_RESET_HERO) {
         await sleep(2);
         player = await this.handleResetHeroes(player);
@@ -860,11 +907,6 @@ class ClientAPI {
         await sleep(2);
         await this.handleUpgradeHeroes(player);
       }
-
-      // if (settings.AUTO_CHALLENGE_CLAN) {
-      //   await sleep(2);
-      //   await this.handleChallengeClan(player);
-      // }
 
       if (settings.AUTO_CHALLENGE) {
         await sleep(2);
