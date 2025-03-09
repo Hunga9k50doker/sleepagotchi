@@ -344,10 +344,9 @@ class ClientAPI {
     const { meta } = data;
     if (!meta.isNextDailyRewardAvailable) return this.log(`You checked in today!`, "warning");
     const resDaily = await this.getDailyRewards();
-
     if (resDaily.success) {
       const { rewards } = resDaily.data;
-      const today = rewards.find((r) => r.state == "availible");
+      const today = rewards.find((r) => r.state == "available");
       if (today) {
         this.log(`Start chekin...`);
         const resCheck = await this.claimDailyRewards();
@@ -842,7 +841,7 @@ class ClientAPI {
         await this.handleCode();
       }
 
-      // await this.handleDaily(player);
+      await this.handleDaily(player);
       await sleep(2);
       await this.handleClaim(player);
       await sleep(2);
@@ -862,10 +861,10 @@ class ClientAPI {
         await this.handleUpgradeHeroes(player);
       }
 
-      if (settings.AUTO_CHALLENGE_CLAN) {
-        await sleep(2);
-        await this.handleChallengeClan(player);
-      }
+      // if (settings.AUTO_CHALLENGE_CLAN) {
+      //   await sleep(2);
+      //   await this.handleChallengeClan(player);
+      // }
 
       if (settings.AUTO_CHALLENGE) {
         await sleep(2);
