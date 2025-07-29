@@ -621,6 +621,7 @@ class ClientAPI {
     await sleep(2);
     const res = await this.getConstellations({
       amount: 10,
+      isRaid: false,
       startIndex: startIndexMap,
     });
     if (res.success) {
