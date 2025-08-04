@@ -635,11 +635,12 @@ class ClientAPI {
     if (!result.success || constellations.length == 0) return;
 
     for (const constellation of constellations) {
-      this.log(`Starting challenge at map ${constellation.name}`);
+      this.log(`Checking challenge at map ${constellation.name}`);
       const challenges = constellation.challenges.filter((c) => c.received < c.value);
       if (challenges.length == 0) {
         continue;
       }
+
       for (const change of challenges) {
         await sleep(1);
         if (Date.now() < change.unlockAt) {
@@ -650,7 +651,7 @@ class ClientAPI {
           this.log(`Waiting for ${hours} hours ${minutes} minutes ${seconds} seconds to complete challenge ${change.name} | Map ${constellation.name}...`.yellow);
           continue;
         }
-        if (change.cooldown > 0) continue;
+        // if (change.cooldown > 0) continue;
 
         let orderedSlots = [];
         let orderedHeroId = [];
