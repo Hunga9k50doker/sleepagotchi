@@ -415,9 +415,7 @@ class ClientAPI {
     this.log(`Checking hero to reset...`);
     let { heroes, resources } = data;
     const { greenStones, gold, gem } = resources;
-    let goldAvailable = gold.amount,
-      gemAvailable = gem.amount,
-      greenStonesAvailable = greenStones.amount;
+    let gemAvailable = gem.amount;
 
     const resets = heroes
       .map((hero) => {
@@ -438,35 +436,27 @@ class ClientAPI {
 
     if (resets.length == 0) {
       this.log(`No hero available to reset!`, "warning");
-      return data;
-    }
-    for (const hero of resets) {
-      if (gem.amount < 100) {
-        this.log(`Not enough Gem to reset!`, "warning");
-        return data;
-      }
-      await sleep(1);
-      this.log(`Resetting hero ${hero.name} | type: ${hero.type}...`);
-      const result = await this.resetHero(hero.heroType);
+    } else {
+      for (const hero of resets) {
+        if (gem.amount < 100) {
+          this.log(`Not enough Gem to reset!`, "warning");
+          break;
+        }
+        await sleep(1);
+        this.log(`Resetting hero ${hero.name} | type: ${hero.type}...`);
+        const result = await this.resetHero(hero.heroType);
 
-      if (result.success) {
-        const { rewards } = result.data;
-        greenStonesAvailable = greenStonesAvailable + rewards.greenStones.amount;
-        goldAvailable = goldAvailable + rewards.gold.amount;
-        gemAvailable -= 100;
-        const newHereos = heroes.filter((h) => h.heroType !== result.data.heroType);
-        data["heroes"] = [...newHereos, result.data];
-        this.log(`Reset hero ${hero.name} successful! | Green stone: ${greenStonesAvailable} | Gold: ${goldAvailable} | Gem: ${gemAvailable}`, "success");
-      } else {
-        this.log(`Reset hero ${hero.name} failed!`, "warning");
+        if (result.success) {
+          gemAvailable -= 100;
+          this.log(`Reset hero ${hero.name} successful!`, "success");
+        } else {
+          this.log(`Reset hero ${hero.name} failed!`, "warning");
+        }
       }
     }
 
     const { data: userInfo } = await this.getUserInfo();
-    if (userInfo) {
-      return userInfo.player;
-    }
-    return data;
+    return userInfo.player;
   }
 
   async handleUpgradeHeroes(data) {
